@@ -1,381 +1,303 @@
-######################################################################
-# File: package.json
-######################################################################
-{
-  "name": "id-dispenser",
-  "version": "1.0.0",
-  "type": "module",
-  "scripts": {
-    "start": "node server.js"
-  },
-  "dependencies": {
-    "express": "^4.19.2",
-    "sqlite3": "^5.1.6",
-    "express-basic-auth": "^1.3.0"
-  }
-}
+/*
+File: server.js
+*/
+const express    = require('express');
+const fs         = require('fs');
+const sqlite3    = require('sqlite3').verbose();
+const bodyParser = require('body-parser');
+const session    = require('express-session');
+const useragent  = require('express-useragent');
+const path       = require('path');
 
-######################################################################
-# File: ids.txt  (place in project root – one ID per line)
-######################################################################
-249-3731-5986
-...
-
-######################################################################
-# File: server.js
-######################################################################
-import express from "express";
-import path from "path";
-import fs from "fs";
-import sqlite3 from "sqlite3";
-import basicAuth from "express-basic-auth";
-
-const __dirname = path.resolve();
 const app = express();
-const PORT = process.env.PORT || 3000;
+const DB  = new sqlite3.Database('db.sqlite');
 
-app.use(express.json());
-app.use(express.static(path.join(__dirname, "public")));
+app.use(bodyParser.json());
+app.use(bodyParser.urlencoded({ extended: true }));
+app.use(session({ secret: 'replace-with-strong-secret', resave: false, saveUninitialized: true }));
+app.use(useragent.express());
+app.use(express.static(path.join(__dirname, 'public')));
 
-// ────────────────────────────────────────────────────────────────────────
-// SQLite setup
-// ────────────────────────────────────────────────────────────────────────
-const db = new sqlite3.Database(path.join(__dirname, "data.db"));
-
-db.serialize(() => {
-  db.run(
-    `CREATE TABLE IF NOT EXISTS ids (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        value TEXT UNIQUE,
-        blocked_until INTEGER DEFAULT 0,
-        confirm_count INTEGER DEFAULT 0
-      )`
-  );
-  db.run(
-    `CREATE TABLE IF NOT EXISTS confirmations (
-        id INTEGER,
-        ip TEXT,
-        user_agent TEXT,
-        confirmed_at INTEGER
-      )`
-  );
+// Инициализация БД и загрузка ID
+DB.serialize(() => {
+  DB.run('CREATE TABLE IF NOT EXISTS ids (id INTEGER PRIMARY KEY AUTOINCREMENT, value TEXT UNIQUE, locked_until INTEGER DEFAULT 0, confirmed_count INTEGER DEFAULT 0)');
+  DB.run('CREATE TABLE IF NOT EXISTS confirmations (id INTEGER PRIMARY KEY AUTOINCREMENT, id_ref INTEGER, ip TEXT, device TEXT, timestamp INTEGER, FOREIGN KEY(id_ref) REFERENCES ids(id))');
+  const lines = fs.existsSync('ids.txt')
+    ? fs.readFileSync('ids.txt','utf-8').split(/\r?\n/).filter(Boolean)
+    : [];
+  const stmt = DB.prepare('INSERT OR IGNORE INTO ids(value) VALUES(?)');
+  lines.forEach(line => stmt.run(line));
+  stmt.finalize();
 });
 
-function seedIds() {
-  const source = path.join(__dirname, "ids.txt");
-  if (!fs.existsSync(source)) return;
-  const lines = fs
-    .readFileSync(source, "utf-8")
-    .split(/\r?\n/)
-    .filter(Boolean);
-  const stmt = db.prepare(`INSERT OR IGNORE INTO ids(value) VALUES (?)`);
-  db.serialize(() => {
-    lines.forEach((l) => stmt.run(l.trim()));
-  });
-  stmt.finalize();
-}
-seedIds();
-
-const now = () => Math.floor(Date.now() / 1000);
-
-// ────────────────────────────────────────────────────────────────────────
-// Public API
-// ────────────────────────────────────────────────────────────────────────
-app.get("/api/get-id", (req, res) => {
-  db.get(
-    `SELECT * FROM ids
-       WHERE confirm_count < 10
-         AND blocked_until < ?
-       ORDER BY id
-       LIMIT 1`,
-    [now()],
-    (err, row) => {
-      if (err) return res.status(500).json({ error: err.message });
-      if (!row) return res.status(404).json({ error: "Нет доступных ID" });
-
-      const blockUntil = now() + 120; // 2‑минутная блокировка
-      db.run(`UPDATE ids SET blocked_until=? WHERE id=?`, [blockUntil, row.id]);
-      res.json({ id: row.id, value: row.value });
+// Получить следующий ID (2 мин блокировки)
+app.post('/api/get-id', (req, res) => {
+  const now = Date.now();
+  DB.get(
+    'SELECT * FROM ids WHERE locked_until < ? AND confirmed_count < 10 ORDER BY id LIMIT 1',
+    [now], (err, row) => {
+      if (err) return res.status(500).json({ success:false, error:err.message });
+      if (!row) return res.json({ success:false, message:'Нет доступных ID' });
+      const lockUntil = now + 2*60*1000;
+      DB.run('UPDATE ids SET locked_until = ? WHERE id = ?', [lockUntil, row.id], lockErr => {
+        if (lockErr) return res.status(500).json({ success:false, error:lockErr.message });
+        req.session.currentId = row.id;
+        res.json({ success:true, id:row.id, value:row.value });
+      });
     }
   );
 });
 
-app.post("/api/confirm-id", (req, res) => {
-  const { id } = req.body;
-  if (!id) return res.status(400).json({ error: "id required" });
-
-  const ip = req.headers["x-forwarded-for"] || req.socket.remoteAddress;
-  const ua = req.headers["user-agent"] || "";
-
-  db.get(`SELECT confirm_count FROM ids WHERE id=?`, [id], (err, row) => {
-    if (err || !row) return res.status(404).json({ error: "Not found" });
-    if (row.confirm_count >= 10)
-      return res.status(400).json({ error: "Max confirmations reached" });
-
-    const blockUntil = now() + 24 * 3600; // 24‑часовая блокировка
-    db.run(`UPDATE ids SET confirm_count=confirm_count+1, blocked_until=? WHERE id=?`, [
-      blockUntil,
-      id,
-    ]);
-    db.run(
-      `INSERT INTO confirmations(id, ip, user_agent, confirmed_at) VALUES (?,?,?,?)`,
-      [id, ip, ua, now()]
+// Подтвердить ID (24ч блокировка + лог)
+app.post('/api/confirm-id', (req, res) => {
+  const id = req.session.currentId;
+  if (!id) return res.json({ success:false, message:'Нет текущего ID в сессии' });
+  const now = Date.now();
+  DB.get('SELECT confirmed_count FROM ids WHERE id = ?', [id], (err, row) => {
+    if (err) return res.status(500).json({ success:false, error:err.message });
+    if (row.confirmed_count >= 10) return res.json({ success:false, message:'Максимум подтверждений достигнут' });
+    const lockUntil = now + 24*60*60*1000;
+    DB.run(
+      'UPDATE ids SET locked_until = ?, confirmed_count = confirmed_count + 1 WHERE id = ?',
+      [lockUntil, id], updErr => {
+        if (updErr) return res.status(500).json({ success:false, error:updErr.message });
+        DB.run(
+          'INSERT INTO confirmations(id_ref,ip,device,timestamp) VALUES(?,?,?,?)',
+          [id, req.ip, req.useragent.source, now], insErr => {
+            if (insErr) return res.status(500).json({ success:false, error:insErr.message });
+            delete req.session.currentId;
+            res.json({ success:true });
+          }
+        );
+      }
     );
-    res.json({ success: true });
   });
 });
 
-// ────────────────────────────────────────────────────────────────────────
-// Admin API (basic auth: admin / password)
-// ────────────────────────────────────────────────────────────────────────
-app.use(
-  "/admin",
-  basicAuth({ users: { admin: "password" }, challenge: true })
-);
+// Admin: получить все ID с IP последнего подтверждения
+app.get('/api/admin/ids', (req, res) => {
+  const now = Date.now();
+  DB.all(
+    `SELECT ids.*, 
+      (SELECT timestamp FROM confirmations WHERE id_ref=ids.id ORDER BY timestamp DESC LIMIT 1) AS last_confirmed,
+      (SELECT ip FROM confirmations WHERE id_ref=ids.id ORDER BY timestamp DESC LIMIT 1) AS last_ip
+    FROM ids ORDER BY id`,
+    [], (err, rows) => {
+      if (err) return res.status(500).json({ success:false, error:err.message });
+      const data = rows.map(r => ({
+        id: r.id,
+        value: r.value,
+        confirmed_count: r.confirmed_count,
+        last_confirmed: r.last_confirmed || 0,
+        last_ip: r.last_ip || '-',
+        time_to_unlock: r.locked_until > now ? r.locked_until - now : 0
+      }));
+      res.json({ success:true, data });
+    }
+  );
+});
 
-app.get("/admin/data", (req, res) => {
-  db.all(`SELECT * FROM ids`, (err, rows) => {
-    if (err) return res.status(500).json({ error: err.message });
-    res.json(rows);
+// Admin: добавление нового ID
+app.post('/api/admin/ids/add', (req, res) => {
+  const { value } = req.body;
+  if (!value) return res.json({ success:false, message:'Нет значения ID' });
+  DB.run('INSERT INTO ids(value) VALUES(?)', [value], function(err) {
+    if (err) return res.status(500).json({ success:false, error:err.message });
+    res.json({ success:true, id:this.lastID });
   });
 });
 
-app.get("/admin/confirmations", (req, res) => {
-  db.all(`SELECT * FROM confirmations`, (err, rows) => {
-    if (err) return res.status(500).json({ error: err.message });
-    res.json(rows);
+// Admin: редактировать/блокировать/разблокировать один ID
+app.patch('/api/admin/ids/:id', (req, res) => {
+  const { value, block24, unlock } = req.body;
+  const now = Date.now();
+  const sets = [];
+  const params = [];
+  if (value !== undefined) { sets.push('value = ?'); params.push(value); }
+  if (block24)           { sets.push('locked_until = ?'); params.push(now + 24*60*60*1000); }
+  if (unlock)            { sets.push('locked_until = 0'); }
+  if (!sets.length) return res.json({ success:false, message:'Нет изменений' });
+  params.push(req.params.id);
+  DB.run('UPDATE ids SET ' + sets.join(', ') + ' WHERE id = ?', params, function(err) {
+    if (err) return res.status(500).json({ success:false, error:err.message });
+    res.json({ success:true });
   });
 });
 
-app.post("/admin/update", (req, res) => {
-  const { action, ids, data } = req.body; // ids = [1,2,3]
-  if (!Array.isArray(ids) || !ids.length)
-    return res.status(400).json({ error: "ids required" });
-
-  const placeholders = ids.map(() => "?").join(",");
-
-  switch (action) {
-    case "unblock":
-      db.run(`UPDATE ids SET blocked_until=0 WHERE id IN (${placeholders})`, ids);
-      break;
-    case "delete":
-      db.run(`DELETE FROM ids WHERE id IN (${placeholders})`, ids);
-      break;
-    case "setConfirmCount":
-      db.run(
-        `UPDATE ids SET confirm_count=? WHERE id IN (${placeholders})`,
-        [data, ...ids]
-      );
-      break;
-    case "editId":
-      if (ids.length !== 1)
-        return res.status(400).json({ error: "edit exactly one ID" });
-      db.run(`UPDATE ids SET value=? WHERE id=?`, [data, ids[0]]);
-      break;
-    default:
-      return res.status(400).json({ error: "unknown action" });
-  }
-  res.json({ success: true });
-});
-
-// ────────────────────────────────────────────────────────────────────────
-app.listen(PORT, () => console.log(`⇢ Server running on http://localhost:${PORT}`));
-
-######################################################################
-# File: public/index.html
-######################################################################
-<!DOCTYPE html>
-<html lang="ru">
-  <head>
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>ID‑Dispenser</title>
-    <script src="https://cdn.tailwindcss.com"></script>
-  </head>
-  <body class="bg-gray-900 text-white flex items-center justify-center min-h-screen">
-    <div class="text-center space-y-4">
-      <button
-        id="getBtn"
-        class="px-6 py-3 bg-indigo-600 rounded-xl text-lg hover:bg-indigo-700"
-      >
-        Получить ID
-      </button>
-
-      <div id="idBox" class="text-2xl font-mono"></div>
-
-      <div id="actions" class="space-x-4 hidden">
-        <button id="copyBtn" class="px-4 py-2 border rounded-xl">
-          Скопировать
-        </button>
-        <button
-          id="confirmBtn"
-          class="px-4 py-2 bg-green-600 rounded-xl hover:bg-green-700"
-        >
-          Подтвердить
-        </button>
-      </div>
-
-      <div id="msg" class="text-sm text-red-400"></div>
-    </div>
-
-    <script src="js/main.js"></script>
-  </body>
-</html>
-
-######################################################################
-# File: public/js/main.js
-######################################################################
-const getBtn = document.getElementById("getBtn");
-const idBox = document.getElementById("idBox");
-const actions = document.getElementById("actions");
-const copyBtn = document.getElementById("copyBtn");
-const confirmBtn = document.getElementById("confirmBtn");
-const msg = document.getElementById("msg");
-let currentId = null;
-
-getBtn.onclick = async () => {
-  msg.textContent = "";
-  const r = await fetch("/api/get-id");
-  const j = await r.json();
-  if (j.value) {
-    currentId = j.id;
-    idBox.textContent = j.value;
-    actions.classList.remove("hidden");
-  } else {
-    msg.textContent = j.error || "Нет доступных ID";
-  }
-};
-
-copyBtn.onclick = () => navigator.clipboard.writeText(idBox.textContent);
-
-confirmBtn.onclick = async () => {
-  if (!currentId) return;
-  const r = await fetch("/api/confirm-id", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ id: currentId }),
-  });
-  const j = await r.json();
-  if (j.success) {
-    msg.textContent = "ID подтверждён!";
-    actions.classList.add("hidden");
-  } else {
-    msg.textContent = j.error || "Ошибка";
-  }
-};
-
-######################################################################
-# File: public/admin.html
-######################################################################
-<!DOCTYPE html>
-<html lang="ru">
-  <head>
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Admin – ID‑Dispenser</title>
-    <script src="https://cdn.tailwindcss.com"></script>
-  </head>
-  <body class="bg-gray-100 text-gray-900">
-    <div class="container mx-auto p-6">
-      <h1 class="text-2xl font-bold mb-4">Управление ID</h1>
-
-      <div class="flex flex-wrap gap-2 mb-6 items-end">
-        <input id="rangeStart" type="number" class="border p-2 w-24" placeholder="от" />
-        <input id="rangeEnd" type="number" class="border p-2 w-24" placeholder="до" />
-        <select id="action" class="border p-2">
-          <option value="unblock">Снять блокировку</option>
-          <option value="delete">Удалить</option>
-          <option value="setConfirmCount">Изменить подтв.</option>
-        </select>
-        <input id="actionData" class="border p-2 w-32" placeholder="значение" />
-        <button id="apply" class="px-4 py-2 bg-indigo-600 text-white rounded-xl">
-          Применить
-        </button>
-      </div>
-
-      <div class="overflow-x-auto">
-        <table class="min-w-full bg-white text-sm" id="table">
-          <thead>
-            <tr class="bg-gray-200 text-left">
-              <th class="px-2 py-1">#</th>
-              <th class="px-2 py-1">ID</th>
-              <th class="px-2 py-1">Блок. до</th>
-              <th class="px-2 py-1">Подтв.</th>
-            </tr>
-          </thead>
-          <tbody></tbody>
-        </table>
-      </div>
-
-      <h2 class="text-xl font-bold mt-10 mb-2">Логи подтверждений</h2>
-      <div class="overflow-x-auto">
-        <table class="min-w-full bg-white text-sm" id="logTable">
-          <thead>
-            <tr class="bg-gray-200 text-left">
-              <th class="px-2 py-1">ID</th>
-              <th class="px-2 py-1">IP</th>
-              <th class="px-2 py-1">UA</th>
-              <th class="px-2 py-1">Время</th>
-            </tr>
-          </thead>
-          <tbody></tbody>
-        </table>
-      </div>
-    </div>
-
-    <script src="js/admin.js"></script>
-  </body>
-</html>
-
-######################################################################
-# File: public/js/admin.js
-######################################################################
-async function load() {
-  const rows = await (await fetch("/admin/data")).json();
-  const tb = document.querySelector("#table tbody");
-  tb.innerHTML = "";
-  rows.forEach((r) => {
-    const tr = document.createElement("tr");
-    tr.innerHTML = `
-      <td class="border px-2 py-1">${r.id}</td>
-      <td class="border px-2 py-1">${r.value}</td>
-      <td class="border px-2 py-1">${r.blocked_until ? new Date(r.blocked_until * 1000).toLocaleString() : ""}</td>
-      <td class="border px-2 py-1">${r.confirm_count}</td>`;
-    tb.appendChild(tr);
-  });
-
-  const logs = await (await fetch("/admin/confirmations")).json();
-  const lb = document.querySelector("#logTable tbody");
-  lb.innerHTML = "";
-  logs.forEach((l) => {
-    const tr = document.createElement("tr");
-    tr.innerHTML = `
-      <td class="border px-2 py-1">${l.id}</td>
-      <td class="border px-2 py-1">${l.ip}</td>
-      <td class="border px-2 py-1 truncate max-w-xs">${l.user_agent}</td>
-      <td class="border px-2 py-1">${new Date(l.confirmed_at * 1000).toLocaleString()}</td>`;
-    lb.appendChild(tr);
-  });
-}
-
-load();
-
-document.getElementById("apply").onclick = async () => {
-  const start = parseInt(rangeStart.value);
-  const end = parseInt(rangeEnd.value);
-  if (isNaN(start) || isNaN(end) || end < start) return alert("Диапазон указан неверно");
-
+// Admin: массовые операции по диапазону
+app.post('/api/admin/ids/bulk', (req, res) => {
+  const { from, to, set, delta, clear_lock } = req.body;
   const ids = [];
-  for (let i = start; i <= end; i++) ids.push(i);
-
-  await fetch("/admin/update", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      action: action.value,
-      ids,
-      data: actionData.value,
-    }),
+  for (let i = from; i <= to; i++) ids.push(i);
+  if (!ids.length) return res.json({ success:false, message:'Неверный диапазон' });
+  const ph = ids.map(()=>'?' ).join(',');
+  const sets = [];
+  const args = [];
+  if (delta !== undefined) {
+    sets.push(
+      'confirmed_count = CASE ' +
+      'WHEN confirmed_count + ? > 10 THEN 10 ' +
+      'WHEN confirmed_count + ? < 0 THEN 0 ' +
+      'ELSE confirmed_count + ? END'
+    );
+    args.push(delta, delta, delta);
+  }
+  if (set !== undefined) { sets.push('confirmed_count = ?'); args.push(Math.min(set,10)); }
+  if (clear_lock)        { sets.push('locked_until = 0'); }
+  if (!sets.length) return res.json({ success:false, message:'Нет параметров' });
+  DB.run('UPDATE ids SET ' + sets.join(', ') + ' WHERE id IN ('+ph+')', [...args, ...ids], function(err) {
+    if (err) return res.status(500).json({ success:false, error:err.message });
+    res.json({ success:true, changes:this.changes });
   });
-  load();
-};
+});
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log('Server started on port ' + PORT));
+
+/*
+Folder: public/
+- index.html
+- script.js
+- style.css
+- admin.html
+- admin.js
+*/
+
+// public/style.css
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600&display=swap');
+html,body{height:100%;margin:0;font-family:'Inter',sans-serif;background:#fafafa;}
+.container{max-width:1200px;margin:auto;padding:1rem;display:flex;flex-direction:column;height:100%;}
+.header{display:flex;justify-content:space-between;align-items:center;padding:1rem;border-bottom:1px solid #ddd;}
+.header h1{font-size:1.5rem;margin:0;}
+.admin-link{color:#333;text-decoration:none;font-size:1rem;}
+.log-message{display:none;padding:0.75rem;background:#eafaf1;color:#2d7a4b;border-radius:4px;margin-bottom:1rem;}
+.bulk-section{display:flex;gap:0.5rem;align-items:center;padding:1rem 0;flex-wrap:wrap;}
+.bulk-section input, .bulk-section button{padding:0.5rem;font-size:0.9rem;}
+table{width:100%;border-collapse:collapse;flex:1;overflow:auto;}
+th,td{padding:0.5rem 0.75rem;border-bottom:1px solid #eee;}
+th{background:#fff;position:sticky;top:0;border-bottom:2px solid #ddd;}
+.select-checkbox{transform:scale(1.2);} 
+.action-buttons{display:flex;gap:0.25rem;} 
+.btn{background:#0053ba;color:#fff;border:none;border-radius:4px;padding:0.5rem;cursor:pointer;display:flex;align-items:center;gap:0.25rem;}  
+.btn:hover{background:#0041a3;}
+
+// public/admin.html
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1.0">
+  <title>Admin - Управление ID</title>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+</head>
+<body>
+  <div class="container">
+    <header class="header">
+      <h1>Управление ID</h1>
+      <a href="index.html" class="admin-link"><i class="fa fa-ticket-alt"></i> Клиент</a>
+    </header>
+    <div id="logMsg" class="log-message"></div>
+    <section class="bulk-section">
+      <button id="refreshBtn" class="btn"><i class="fa fa-sync"></i> Обновить</button>
+      <input type="number" id="rangeFrom" placeholder="От ID" min="1">
+      <input type="number" id="rangeTo"   placeholder="До ID" min="1">
+      <input type="text"   id="bulkValue" placeholder="+/-n или число">
+      <label><input type="checkbox" id="bulkClearLock"> Снять блок</label>
+      <button id="bulkBtn" class="btn"><i class="fa fa-check"></i> Применить</button>
+      <input type="text" id="addValue" placeholder="Новый ID">
+      <button id="addBtn" class="btn"><i class="fa fa-plus"></i> Добавить</button>
+    </section>
+    <table id="idsTable">
+      <thead>
+        <tr>
+          <th><input type="checkbox" id="selectAll"></th>
+          <th>ID</th><th>Значение</th><th>Подтв. счёт</th><th>Последнее под.</th><th>IP</th><th>До разб.</th><th>Действия</th>
+        </tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+  </div>
+  <script src="admin.js"></script>
+</body>
+</html>
+
+// public/admin.js
+(async ()=>{
+  const logMsg=document.getElementById('logMsg');
+  const showLog=text=>{ logMsg.textContent=text; logMsg.style.display='block'; setTimeout(()=>logMsg.style.display='none',5000); };
+
+  async function fetchIds(){
+    const r=await fetch('/api/admin/ids'), j=await r.json(); if(!j.success) return alert(j.error);
+    const tbody=document.querySelector('#idsTable tbody'); tbody.innerHTML='';
+    j.data.forEach(r=>{
+      const until=r.time_to_unlock>0?new Date(r.time_to_unlock).toISOString().substr(11,8):'-';
+      const last =r.last_confirmed?new Date(r.last_confirmed).toLocaleString():'-';
+      const tr=document.createElement('tr');
+      tr.innerHTML=
+        `<td><input type="checkbox" class="select-checkbox" data-id="${r.id}"></td>`+
+        `<td>${r.id}</td>`+
+        `<td><input class="valueInput" value="${r.value}"></td>`+
+        `<td>${r.confirmed_count}</td>`+
+        `<td>${last}</td>`+
+        `<td>${r.last_ip}</td>`+
+        `<td>${until}</td>`+
+        `<td class="action-buttons">`+
+          `<button class="saveBtn btn"   data-id="${r.id}"><i class="fa fa-floppy-disk"></i></button>`+
+          `<button class="blockBtn btn"  data-id="${r.id}"><i class="fa fa-lock"></i></button>`+
+          `<button class="unlockBtn btn" data-id="${r.id}"><i class="fa fa-lock-open"></i></button>`+
+        `</td>`;
+      tbody.appendChild(tr);
+    }); attachHandlers();
+  }
+
+  function attachHandlers(){
+    document.getElementById('selectAll').onclick=e=>{
+      document.querySelectorAll('.select-checkbox').forEach(cb=>cb.checked=e.target.checked);
+    };
+    document.querySelectorAll('.saveBtn').forEach(b=>b.onclick=async()=>{
+      const id=b.dataset.id; const val=b.closest('tr').querySelector('.valueInput').value;
+      const r=await fetch(`/api/admin/ids/${id}`,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({value:val})});
+      const j=await r.json(); if(j.success) showLog('ID '+id+' обновлён'); else alert(j.error);
+      fetchIds();
+    });
+    document.querySelectorAll('.blockBtn').forEach(b=>b.onclick=async()=>{
+      const id=b.dataset.id;
+      const r=await fetch(`/api/admin/ids/${id}`,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({block24:true})});
+      const j=await r.json(); if(j.success) showLog('ID '+id+' заблокирован'); else alert(j.error);
+      fetchIds();
+    });
+    document.querySelectorAll('.unlockBtn').forEach(b=>b.onclick=async()=>{
+      const id=b.dataset.id;
+      const r=await fetch(`/api/admin/ids/${id}`,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({unlock:true})});
+      const j=await r.json(); if(j.success) showLog('ID '+id+' разблокирован'); else alert(j.error);
+      fetchIds();
+    });
+  }
+
+  document.getElementById('refreshBtn').onclick=fetchIds;
+
+  document.getElementById('bulkBtn').onclick=async()=>{
+    const from=parseInt(document.getElementById('rangeFrom').value),
+          to  =parseInt(document.getElementById('rangeTo').value),
+          raw =document.getElementById('bulkValue').value.trim(),
+          clear_lock=document.getElementById('bulkClearLock').checked;
+    let set,delta;
+    if(/^[-+]\d+$/.test(raw)) delta=parseInt(raw);
+    else if(/^\d+$/.test(raw)) set=parseInt(raw);
+    const r=await fetch('/api/admin/ids/bulk',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({from,to,set,delta,clear_lock})});
+    const j=await r.json(); if(j.success) showLog('Массово изменено '+j.changes+' записей'); else alert(j.error);
+    fetchIds();
+  };
+
+  document.getElementById('addBtn').onclick=async()=>{
+    const v=document.getElementById('addValue').value.trim();
+    if(!v) return alert('Введите новый ID');
+    const r=await fetch('/api/admin/ids/add',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({value:v})});
+    const j=await r.json(); if(j.success) showLog('Добавлен ID #'+j.id); else alert(j.error);
+    fetchIds();
+  };
+
+  fetchIds();
+})();
