@@ -1,0 +1,381 @@
+######################################################################
+# File: package.json
+######################################################################
+{
+  "name": "id-dispenser",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "sqlite3": "^5.1.6",
+    "express-basic-auth": "^1.3.0"
+  }
+}
+
+######################################################################
+# File: ids.txt  (place in project root – one ID per line)
+######################################################################
+249-3731-5986
+...
+
+######################################################################
+# File: server.js
+######################################################################
+import express from "express";
+import path from "path";
+import fs from "fs";
+import sqlite3 from "sqlite3";
+import basicAuth from "express-basic-auth";
+
+const __dirname = path.resolve();
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+app.use(express.json());
+app.use(express.static(path.join(__dirname, "public")));
+
+// ────────────────────────────────────────────────────────────────────────
+// SQLite setup
+// ────────────────────────────────────────────────────────────────────────
+const db = new sqlite3.Database(path.join(__dirname, "data.db"));
+
+db.serialize(() => {
+  db.run(
+    `CREATE TABLE IF NOT EXISTS ids (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        value TEXT UNIQUE,
+        blocked_until INTEGER DEFAULT 0,
+        confirm_count INTEGER DEFAULT 0
+      )`
+  );
+  db.run(
+    `CREATE TABLE IF NOT EXISTS confirmations (
+        id INTEGER,
+        ip TEXT,
+        user_agent TEXT,
+        confirmed_at INTEGER
+      )`
+  );
+});
+
+function seedIds() {
+  const source = path.join(__dirname, "ids.txt");
+  if (!fs.existsSync(source)) return;
+  const lines = fs
+    .readFileSync(source, "utf-8")
+    .split(/\r?\n/)
+    .filter(Boolean);
+  const stmt = db.prepare(`INSERT OR IGNORE INTO ids(value) VALUES (?)`);
+  db.serialize(() => {
+    lines.forEach((l) => stmt.run(l.trim()));
+  });
+  stmt.finalize();
+}
+seedIds();
+
+const now = () => Math.floor(Date.now() / 1000);
+
+// ────────────────────────────────────────────────────────────────────────
+// Public API
+// ────────────────────────────────────────────────────────────────────────
+app.get("/api/get-id", (req, res) => {
+  db.get(
+    `SELECT * FROM ids
+       WHERE confirm_count < 10
+         AND blocked_until < ?
+       ORDER BY id
+       LIMIT 1`,
+    [now()],
+    (err, row) => {
+      if (err) return res.status(500).json({ error: err.message });
+      if (!row) return res.status(404).json({ error: "Нет доступных ID" });
+
+      const blockUntil = now() + 120; // 2‑минутная блокировка
+      db.run(`UPDATE ids SET blocked_until=? WHERE id=?`, [blockUntil, row.id]);
+      res.json({ id: row.id, value: row.value });
+    }
+  );
+});
+
+app.post("/api/confirm-id", (req, res) => {
+  const { id } = req.body;
+  if (!id) return res.status(400).json({ error: "id required" });
+
+  const ip = req.headers["x-forwarded-for"] || req.socket.remoteAddress;
+  const ua = req.headers["user-agent"] || "";
+
+  db.get(`SELECT confirm_count FROM ids WHERE id=?`, [id], (err, row) => {
+    if (err || !row) return res.status(404).json({ error: "Not found" });
+    if (row.confirm_count >= 10)
+      return res.status(400).json({ error: "Max confirmations reached" });
+
+    const blockUntil = now() + 24 * 3600; // 24‑часовая блокировка
+    db.run(`UPDATE ids SET confirm_count=confirm_count+1, blocked_until=? WHERE id=?`, [
+      blockUntil,
+      id,
+    ]);
+    db.run(
+      `INSERT INTO confirmations(id, ip, user_agent, confirmed_at) VALUES (?,?,?,?)`,
+      [id, ip, ua, now()]
+    );
+    res.json({ success: true });
+  });
+});
+
+// ────────────────────────────────────────────────────────────────────────
+// Admin API (basic auth: admin / password)
+// ────────────────────────────────────────────────────────────────────────
+app.use(
+  "/admin",
+  basicAuth({ users: { admin: "password" }, challenge: true })
+);
+
+app.get("/admin/data", (req, res) => {
+  db.all(`SELECT * FROM ids`, (err, rows) => {
+    if (err) return res.status(500).json({ error: err.message });
+    res.json(rows);
+  });
+});
+
+app.get("/admin/confirmations", (req, res) => {
+  db.all(`SELECT * FROM confirmations`, (err, rows) => {
+    if (err) return res.status(500).json({ error: err.message });
+    res.json(rows);
+  });
+});
+
+app.post("/admin/update", (req, res) => {
+  const { action, ids, data } = req.body; // ids = [1,2,3]
+  if (!Array.isArray(ids) || !ids.length)
+    return res.status(400).json({ error: "ids required" });
+
+  const placeholders = ids.map(() => "?").join(",");
+
+  switch (action) {
+    case "unblock":
+      db.run(`UPDATE ids SET blocked_until=0 WHERE id IN (${placeholders})`, ids);
+      break;
+    case "delete":
+      db.run(`DELETE FROM ids WHERE id IN (${placeholders})`, ids);
+      break;
+    case "setConfirmCount":
+      db.run(
+        `UPDATE ids SET confirm_count=? WHERE id IN (${placeholders})`,
+        [data, ...ids]
+      );
+      break;
+    case "editId":
+      if (ids.length !== 1)
+        return res.status(400).json({ error: "edit exactly one ID" });
+      db.run(`UPDATE ids SET value=? WHERE id=?`, [data, ids[0]]);
+      break;
+    default:
+      return res.status(400).json({ error: "unknown action" });
+  }
+  res.json({ success: true });
+});
+
+// ────────────────────────────────────────────────────────────────────────
+app.listen(PORT, () => console.log(`⇢ Server running on http://localhost:${PORT}`));
+
+######################################################################
+# File: public/index.html
+######################################################################
+<!DOCTYPE html>
+<html lang="ru">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>ID‑Dispenser</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+  </head>
+  <body class="bg-gray-900 text-white flex items-center justify-center min-h-screen">
+    <div class="text-center space-y-4">
+      <button
+        id="getBtn"
+        class="px-6 py-3 bg-indigo-600 rounded-xl text-lg hover:bg-indigo-700"
+      >
+        Получить ID
+      </button>
+
+      <div id="idBox" class="text-2xl font-mono"></div>
+
+      <div id="actions" class="space-x-4 hidden">
+        <button id="copyBtn" class="px-4 py-2 border rounded-xl">
+          Скопировать
+        </button>
+        <button
+          id="confirmBtn"
+          class="px-4 py-2 bg-green-600 rounded-xl hover:bg-green-700"
+        >
+          Подтвердить
+        </button>
+      </div>
+
+      <div id="msg" class="text-sm text-red-400"></div>
+    </div>
+
+    <script src="js/main.js"></script>
+  </body>
+</html>
+
+######################################################################
+# File: public/js/main.js
+######################################################################
+const getBtn = document.getElementById("getBtn");
+const idBox = document.getElementById("idBox");
+const actions = document.getElementById("actions");
+const copyBtn = document.getElementById("copyBtn");
+const confirmBtn = document.getElementById("confirmBtn");
+const msg = document.getElementById("msg");
+let currentId = null;
+
+getBtn.onclick = async () => {
+  msg.textContent = "";
+  const r = await fetch("/api/get-id");
+  const j = await r.json();
+  if (j.value) {
+    currentId = j.id;
+    idBox.textContent = j.value;
+    actions.classList.remove("hidden");
+  } else {
+    msg.textContent = j.error || "Нет доступных ID";
+  }
+};
+
+copyBtn.onclick = () => navigator.clipboard.writeText(idBox.textContent);
+
+confirmBtn.onclick = async () => {
+  if (!currentId) return;
+  const r = await fetch("/api/confirm-id", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ id: currentId }),
+  });
+  const j = await r.json();
+  if (j.success) {
+    msg.textContent = "ID подтверждён!";
+    actions.classList.add("hidden");
+  } else {
+    msg.textContent = j.error || "Ошибка";
+  }
+};
+
+######################################################################
+# File: public/admin.html
+######################################################################
+<!DOCTYPE html>
+<html lang="ru">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Admin – ID‑Dispenser</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+  </head>
+  <body class="bg-gray-100 text-gray-900">
+    <div class="container mx-auto p-6">
+      <h1 class="text-2xl font-bold mb-4">Управление ID</h1>
+
+      <div class="flex flex-wrap gap-2 mb-6 items-end">
+        <input id="rangeStart" type="number" class="border p-2 w-24" placeholder="от" />
+        <input id="rangeEnd" type="number" class="border p-2 w-24" placeholder="до" />
+        <select id="action" class="border p-2">
+          <option value="unblock">Снять блокировку</option>
+          <option value="delete">Удалить</option>
+          <option value="setConfirmCount">Изменить подтв.</option>
+        </select>
+        <input id="actionData" class="border p-2 w-32" placeholder="значение" />
+        <button id="apply" class="px-4 py-2 bg-indigo-600 text-white rounded-xl">
+          Применить
+        </button>
+      </div>
+
+      <div class="overflow-x-auto">
+        <table class="min-w-full bg-white text-sm" id="table">
+          <thead>
+            <tr class="bg-gray-200 text-left">
+              <th class="px-2 py-1">#</th>
+              <th class="px-2 py-1">ID</th>
+              <th class="px-2 py-1">Блок. до</th>
+              <th class="px-2 py-1">Подтв.</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+
+      <h2 class="text-xl font-bold mt-10 mb-2">Логи подтверждений</h2>
+      <div class="overflow-x-auto">
+        <table class="min-w-full bg-white text-sm" id="logTable">
+          <thead>
+            <tr class="bg-gray-200 text-left">
+              <th class="px-2 py-1">ID</th>
+              <th class="px-2 py-1">IP</th>
+              <th class="px-2 py-1">UA</th>
+              <th class="px-2 py-1">Время</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </div>
+
+    <script src="js/admin.js"></script>
+  </body>
+</html>
+
+######################################################################
+# File: public/js/admin.js
+######################################################################
+async function load() {
+  const rows = await (await fetch("/admin/data")).json();
+  const tb = document.querySelector("#table tbody");
+  tb.innerHTML = "";
+  rows.forEach((r) => {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `
+      <td class="border px-2 py-1">${r.id}</td>
+      <td class="border px-2 py-1">${r.value}</td>
+      <td class="border px-2 py-1">${r.blocked_until ? new Date(r.blocked_until * 1000).toLocaleString() : ""}</td>
+      <td class="border px-2 py-1">${r.confirm_count}</td>`;
+    tb.appendChild(tr);
+  });
+
+  const logs = await (await fetch("/admin/confirmations")).json();
+  const lb = document.querySelector("#logTable tbody");
+  lb.innerHTML = "";
+  logs.forEach((l) => {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `
+      <td class="border px-2 py-1">${l.id}</td>
+      <td class="border px-2 py-1">${l.ip}</td>
+      <td class="border px-2 py-1 truncate max-w-xs">${l.user_agent}</td>
+      <td class="border px-2 py-1">${new Date(l.confirmed_at * 1000).toLocaleString()}</td>`;
+    lb.appendChild(tr);
+  });
+}
+
+load();
+
+document.getElementById("apply").onclick = async () => {
+  const start = parseInt(rangeStart.value);
+  const end = parseInt(rangeEnd.value);
+  if (isNaN(start) || isNaN(end) || end < start) return alert("Диапазон указан неверно");
+
+  const ids = [];
+  for (let i = start; i <= end; i++) ids.push(i);
+
+  await fetch("/admin/update", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      action: action.value,
+      ids,
+      data: actionData.value,
+    }),
+  });
+  load();
+};
